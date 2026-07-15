@@ -1,14 +1,17 @@
 """Matrix (Element) channel — inbound sync + outbound message/media delivery."""
 
 import asyncio
+import html
 import json
 import mimetypes
+import re
+import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from pydantic import Field
 
@@ -17,7 +20,7 @@ from nanobot.security.workspace_policy import is_path_within
 try:
     import aiohttp
     import nh3
-    from mistune import create_markdown
+    from mistune import HTMLRenderer, create_markdown
     from nio import (
         AsyncClient,
         AsyncClientConfig,
@@ -45,7 +48,7 @@ try:
     from nio.exceptions import EncryptionError
 except ImportError as e:
     raise ImportError(
-        "Matrix dependencies not installed. Run: pip install nanobot-ai[matrix]"
+        "Matrix dependencies not installed. Run: nanobot plugins enable matrix"
     ) from e
 
 from nanobot.bus.events import OutboundMessage
@@ -76,7 +79,7 @@ class _MediaTooLargeError(Exception):
     """Raised when an inbound Matrix media download exceeds the configured cap."""
 
 MATRIX_MARKDOWN = create_markdown(
-    escape=True,
+    renderer=HTMLRenderer(escape=True, allow_harmful_protocols=("mxc://",)),
     plugins=["table", "strikethrough", "url", "superscript", "subscript"],
 )
 
@@ -91,6 +94,19 @@ MATRIX_ALLOWED_HTML_ATTRIBUTES: dict[str, set[str]] = {
     "img": {"src", "alt", "title", "width", "height"},
 }
 MATRIX_ALLOWED_URL_SCHEMES = {"https", "http", "matrix", "mailto", "mxc"}
+_MXC_IMAGE_PLACEHOLDER_PREFIX = "https://nanobot.invalid/matrix-mxc/"
+_MXC_MARKDOWN_IMAGE_RE = re.compile(
+    r"(?P<prefix>!\[[^\]]*\]\()"
+    r"(?P<value>mxc://[^\s)]+)"
+    r"(?P<suffix>(?:\s+[^)]*)?\))"
+)
+_MXC_IMAGE_SRC_RE = re.compile(
+    r"(?P<prefix>\bsrc=)(?P<quote>[\"'])(?P<value>mxc://[^\"']+)(?P=quote)",
+    re.IGNORECASE,
+)
+_MXC_PLACEHOLDER_SRC_RE = re.compile(
+    rf'src="{re.escape(_MXC_IMAGE_PLACEHOLDER_PREFIX)}([^"]+)"'
+)
 
 
 def _filter_matrix_html_attribute(tag: str, attr: str, value: str) -> str | None:
@@ -98,7 +114,10 @@ def _filter_matrix_html_attribute(tag: str, attr: str, value: str) -> str | None
     if tag == "a" and attr == "href":
         return value if value.lower().startswith(("https://", "http://", "matrix:", "mailto:")) else None
     if tag == "img" and attr == "src":
-        return value if value.lower().startswith("mxc://") else None
+        lowered = value.lower()
+        if lowered.startswith("mxc://") or lowered.startswith(_MXC_IMAGE_PLACEHOLDER_PREFIX):
+            return value
+        return None
     if tag == "code" and attr == "class":
         classes = [c for c in value.split() if c.startswith("language-") and not c.startswith("language-_")]
         return " ".join(classes) if classes else None
@@ -113,6 +132,39 @@ MATRIX_HTML_CLEANER = nh3.Cleaner(
     strip_comments=True,
     link_rel="noopener noreferrer",
 )
+
+
+def _mask_mxc_markdown_image_sources(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        value = quote(match.group("value"), safe="")
+        return (
+            f"{match.group('prefix')}"
+            f"{_MXC_IMAGE_PLACEHOLDER_PREFIX}{value}"
+            f"{match.group('suffix')}"
+        )
+
+    return _MXC_MARKDOWN_IMAGE_RE.sub(repl, text)
+
+
+def _mask_mxc_image_sources(rendered_html: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        value = quote(match.group("value"), safe="")
+        return (
+            f'{match.group("prefix")}{match.group("quote")}'
+            f"{_MXC_IMAGE_PLACEHOLDER_PREFIX}{value}"
+            f'{match.group("quote")}'
+        )
+
+    return _MXC_IMAGE_SRC_RE.sub(repl, rendered_html)
+
+
+def _unmask_mxc_image_sources(cleaned_html: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        value = html.escape(unquote(match.group(1)), quote=True)
+        return f'src="{value}"'
+
+    return _MXC_PLACEHOLDER_SRC_RE.sub(repl, cleaned_html)
+
 
 @dataclass
 class _StreamBuf:
@@ -134,7 +186,9 @@ class _StreamBuf:
 def _render_markdown_html(text: str) -> str | None:
     """Render markdown to sanitized HTML; returns None for plain text."""
     try:
-        formatted = MATRIX_HTML_CLEANER.clean(MATRIX_MARKDOWN(text)).strip()
+        masked_text = _mask_mxc_markdown_image_sources(text)
+        rendered = _mask_mxc_image_sources(MATRIX_MARKDOWN(masked_text))
+        formatted = _unmask_mxc_image_sources(MATRIX_HTML_CLEANER.clean(rendered).strip())
     except Exception:
         return None
     if not formatted:
@@ -191,6 +245,10 @@ def _build_matrix_text_content(
     return content
 
 
+def _matrix_stream_key(chat_id: str, stream_id: str | None) -> str:
+    return chat_id if stream_id is None else f"{chat_id}\0{stream_id}"
+
+
 class MatrixConfig(Base):
     """Matrix (Element) channel configuration."""
 
@@ -200,7 +258,7 @@ class MatrixConfig(Base):
     password: str = ""
     access_token: str = ""
     device_id: str = ""
-    e2ee_enabled: bool = Field(default=True, alias="e2eeEnabled")
+    e2ee_enabled: bool = Field(default=sys.platform != "win32", alias="e2eeEnabled")
     sas_verification: bool = Field(default=False, alias="sasVerification")
     sync_stop_grace_seconds: int = 2
     max_media_bytes: int = 20 * 1024 * 1024
@@ -501,7 +559,7 @@ class MatrixChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         """Send outbound content; clear typing for non-progress messages."""
         if not self.client:
-            return
+            raise RuntimeError("Matrix client not initialized")
         text = msg.content or ""
         candidates = self._collect_outbound_media_candidates(msg.media)
         relates_to = self._build_thread_relates_to(msg.metadata)
@@ -524,7 +582,9 @@ class MatrixChannel(BaseChannel):
                 content = _build_matrix_text_content(text)
                 if relates_to:
                     content["m.relates_to"] = relates_to
-                await self._send_room_content(msg.chat_id, content)
+                response = await self._send_room_content(msg.chat_id, content)
+                if isinstance(response, RoomSendError):
+                    raise RuntimeError(f"Matrix message was not delivered: {response}")
         finally:
             if not is_progress:
                 await self._stop_typing_keepalive(msg.chat_id, clear_typing=True)
@@ -542,7 +602,8 @@ class MatrixChannel(BaseChannel):
         relates_to = self._build_thread_relates_to(metadata)
 
         if stream_end:
-            buf = self._stream_bufs.pop(chat_id, None)
+            stream_key = _matrix_stream_key(chat_id, stream_id)
+            buf = self._stream_bufs.pop(stream_key, None)
             if not buf or not buf.event_id or not buf.text:
                 return
 
@@ -556,10 +617,11 @@ class MatrixChannel(BaseChannel):
             await self._send_room_content(chat_id, content)
             return
 
-        buf = self._stream_bufs.get(chat_id)
+        stream_key = _matrix_stream_key(chat_id, stream_id)
+        buf = self._stream_bufs.get(stream_key)
         if buf is None:
             buf = _StreamBuf()
-            self._stream_bufs[chat_id] = buf
+            self._stream_bufs[stream_key] = buf
         buf.text += delta
 
         if not buf.text.strip():

@@ -22,7 +22,7 @@ import {
   promptTop,
 } from "@/components/thread/promptNavigation";
 import { cn } from "@/lib/utils";
-import type { CliAppInfo, McpPresetInfo, UIMessage } from "@/lib/types";
+import type { CliAppInfo, McpPresetInfo, SlashCommand, UIMessage } from "@/lib/types";
 
 export interface ThreadViewportHandle {
   jumpToUserPrompt: (promptId: string) => void;
@@ -40,6 +40,7 @@ interface ThreadViewportProps {
   showScrollToBottomButton?: boolean;
   cliApps?: CliAppInfo[];
   mcpPresets?: McpPresetInfo[];
+  slashCommands?: SlashCommand[];
   forkBoundaryMessageCount?: number | null;
   hasMoreBefore?: boolean;
   loadingOlder?: boolean;
@@ -111,6 +112,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   showScrollToBottomButton = true,
   cliApps = [],
   mcpPresets = [],
+  slashCommands = [],
   forkBoundaryMessageCount = null,
   hasMoreBefore = false,
   loadingOlder = false,
@@ -455,6 +457,13 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     measureComposerDock();
   }, [composer, hasMessages, measureComposerDock]);
 
+  useLayoutEffect(() => {
+    if (!hasMessages || userReadingHistoryRef.current) return;
+    const promptId = activeTurnPromptRef.current;
+    if (promptId && scrollToPromptTopNow(promptId)) return;
+    scrollToBottom(false, 2);
+  }, [composerDockHeight, hasMessages, scrollToBottom, scrollToPromptTopNow]);
+
   useEffect(() => cancelScheduledBottomScroll, [cancelScheduledBottomScroll]);
 
   useEffect(() => {
@@ -494,7 +503,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   }, [maybeLoadEarlierFromScroll]);
 
   return (
-    <div className="relative flex min-h-0 flex-1 overflow-hidden">
+    <div className="thread-viewport relative flex min-h-0 flex-1 overflow-hidden">
       <div
         ref={scrollRef}
         className={cn(
@@ -519,6 +528,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
                   hiddenUserMessageCount={hiddenUserMessageCount}
                   cliApps={cliApps}
                   mcpPresets={mcpPresets}
+                  slashCommands={slashCommands}
                   forkBoundaryMessageCount={visibleForkBoundaryMessageCount}
                   onOpenFilePreview={onOpenFilePreview}
                   onForkFromMessage={onForkFromMessage}

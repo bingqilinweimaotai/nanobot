@@ -103,7 +103,7 @@ class WecomChannel(BaseChannel):
     async def start(self) -> None:
         """Start the WeCom bot with WebSocket long connection."""
         if not WECOM_AVAILABLE:
-            self.logger.error("SDK not installed. Run: pip install nanobot-ai[wecom]")
+            self.logger.error("SDK not installed. Run: nanobot plugins enable wecom")
             return
 
         if not self.config.bot_id or not self.config.secret:
@@ -493,8 +493,7 @@ class WecomChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WeCom."""
         if not self._client:
-            self.logger.warning("client not initialized")
-            return
+            raise RuntimeError("WeCom client not initialized")
 
         try:
             content = (msg.content or "").strip()
@@ -553,3 +552,4 @@ class WecomChannel(BaseChannel):
 
         except Exception:
             self.logger.exception("Error sending message to chat_id={}", msg.chat_id)
+            raise

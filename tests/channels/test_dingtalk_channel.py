@@ -2,6 +2,7 @@ import asyncio
 import zipfile
 from io import BytesIO
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -17,6 +18,7 @@ if not DINGTALK_AVAILABLE:
     pytest.skip("DingTalk dependencies not installed (dingtalk-stream)", allow_module_level=True)
 
 import nanobot.channels.dingtalk as dingtalk_module
+from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.dingtalk import DingTalkChannel, DingTalkConfig, NanobotDingTalkHandler
 
@@ -401,6 +403,61 @@ async def test_start_configures_http_timeout(monkeypatch) -> None:
     assert timeout.pool == 10.0
 
     await channel.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_stream_client_after_sdk_swallows_first_cancel(monkeypatch) -> None:
+    channel = DingTalkChannel(
+        DingTalkConfig(client_id="app", client_secret="secret", allow_from=["*"]),
+        MessageBus(),
+    )
+    created: dict[str, object] = {}
+
+    class _FakeWebsocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _CancelSwallowingStreamClient:
+        def __init__(self, _credential):
+            self.websocket = _FakeWebsocket()
+            self.started = asyncio.Event()
+            self.cancelled_once = asyncio.Event()
+            created["client"] = self
+
+        def register_callback_handler(self, _topic, _handler):
+            pass
+
+        async def start(self):
+            self.started.set()
+            while True:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.cancelled_once.set()
+                    await asyncio.sleep(3600)
+
+    monkeypatch.setattr(dingtalk_module, "DINGTALK_AVAILABLE", True)
+    monkeypatch.setattr(dingtalk_module, "Credential", lambda *a, **k: object())
+    monkeypatch.setattr(dingtalk_module, "DingTalkStreamClient", _CancelSwallowingStreamClient)
+    monkeypatch.setattr(dingtalk_module, "ChatbotMessage", SimpleNamespace(TOPIC="topic"))
+
+    start_task = asyncio.create_task(channel.start())
+    while "client" not in created:
+        await asyncio.sleep(0)
+    client = created["client"]
+    await asyncio.wait_for(client.started.wait(), timeout=0.5)
+
+    start_task.cancel()
+    await asyncio.wait_for(client.cancelled_once.wait(), timeout=0.5)
+    assert not start_task.done()
+
+    await asyncio.wait_for(channel.stop(), timeout=0.5)
+
+    assert client.websocket.closed is True
+    assert start_task.cancelled()
 
 
 @pytest.mark.asyncio
@@ -807,6 +864,35 @@ async def test_send_batch_message_returns_false_on_api_error() -> None:
         "token", "user123", "sampleMarkdown", {"text": "hello"}
     )
     assert result is True
+
+
+@pytest.mark.asyncio
+async def test_send_raises_when_access_token_is_unavailable(monkeypatch) -> None:
+    channel = DingTalkChannel(
+        DingTalkConfig(client_id="app", client_secret="secret", allow_from=["*"]),
+        MessageBus(),
+    )
+    monkeypatch.setattr(channel, "_get_access_token", AsyncMock(return_value=None))
+
+    with pytest.raises(RuntimeError, match="access token unavailable"):
+        await channel.send(
+            OutboundMessage(channel="dingtalk", chat_id="user123", content="hello")
+        )
+
+
+@pytest.mark.asyncio
+async def test_send_raises_when_text_is_not_delivered(monkeypatch) -> None:
+    channel = DingTalkChannel(
+        DingTalkConfig(client_id="app", client_secret="secret", allow_from=["*"]),
+        MessageBus(),
+    )
+    monkeypatch.setattr(channel, "_get_access_token", AsyncMock(return_value="token"))
+    monkeypatch.setattr(channel, "_send_markdown_text", AsyncMock(return_value=False))
+
+    with pytest.raises(RuntimeError, match="text message was not delivered"):
+        await channel.send(
+            OutboundMessage(channel="dingtalk", chat_id="user123", content="hello")
+        )
 
 
 @pytest.mark.asyncio

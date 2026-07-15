@@ -155,7 +155,7 @@ The key (`webhook`) becomes the config section name. The value points to your `B
 
 ```bash
 python -m pip install -e .
-nanobot plugins list      # verify "Webhook" shows as "plugin"
+nanobot plugins list      # verify the installed example plugin appears as "webhook"
 nanobot onboard           # auto-adds default config for detected plugins
 ```
 
@@ -197,7 +197,19 @@ The agent receives the message and processes it. Replies arrive in your `send()`
 |--------|-------------|
 | `async start()` | **Must block forever.** Connect to platform, listen for messages, call `_handle_message()` on each. If this returns, the channel is dead. |
 | `async stop()` | Set `self._running = False` and clean up. Called when gateway shuts down. |
-| `async send(msg: OutboundMessage)` | Deliver an outbound message to the platform. |
+| `async send(msg: OutboundMessage)` | Deliver an outbound message to the platform. Raise when the transport does not accept it. |
+
+#### Outbound delivery contract
+
+A normal return from `send()` means either the visible payload was accepted by the
+platform transport/API, or the channel deliberately had nothing to deliver (for example,
+an empty progress event). Do not log and return when the client is disconnected, still
+starting, or the platform rejects the request. Raise an exception so `ChannelManager` can
+apply the shared retry policy.
+
+`send()` may run as soon as `is_running` becomes true. If a channel sets `_running` before
+its transport is ready, it must keep raising until delivery can be attempted safely. Small
+platform-specific retries are fine, but the final failure must still reach the manager.
 
 ### Interactive Login
 
@@ -552,7 +564,7 @@ If not overridden, the base class returns `{"enabled": false}`.
 git clone https://github.com/you/nanobot-channel-webhook
 cd nanobot-channel-webhook
 python -m pip install -e .
-nanobot plugins list    # should show "Webhook" as "plugin"
+nanobot plugins list    # should show the installed example plugin as "webhook"
 nanobot gateway         # test end-to-end
 ```
 
@@ -561,8 +573,8 @@ nanobot gateway         # test end-to-end
 ```bash
 $ nanobot plugins list
 
-  Name       Source    Enabled
-  telegram   builtin  yes
-  discord    builtin  no
-  webhook    plugin   yes
+  Name       Type      Enabled
+  discord    channel   no
+  telegram   channel   yes
+  webhook    channel   yes
 ```
