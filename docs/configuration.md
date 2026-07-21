@@ -2036,6 +2036,85 @@ The heartbeat job is backed by the same cron service as user-created reminders. 
 The notification gate runs on a built-in system prompt. Advanced users can override it, but you rarely need to — it's strongly advised to first read the evaluator code and the default `evaluator.md`. To override, drop your prompt at `<workspace>/prompts/evaluator.md`. It must still instruct the model to call the `evaluate_notification` tool; otherwise the gate fails closed and stays silent.
 
 
+## Multi-Agent Teams
+
+The optional team tools execute an explicit dependency graph through multiple isolated worker
+agents. Independent read-only tasks can run concurrently, while tasks using the
+`implement` or `general` capability profiles are serialized by default to avoid conflicting
+workspace writes. `team_run` waits in the foreground, so `/stop` cancels its coordinator and
+active workers together.
+
+For work that should continue after the current model turn, use `team_start`. It returns a run id
+immediately; `team_status` polls without changing the run, `team_wait` waits for completion (and
+resumes an interrupted run), and `team_cancel` stops it. Background state is stored in
+`<workspace>/multiagent/runs.sqlite3`, including the task graph, completed results, dynamic
+delegations, and unread team messages.
+
+The scheduler remains process-local: it is not a daemon and does not automatically restart model
+work after a gateway restart. On the next startup, interrupted runs become `paused`; calling
+`team_wait` resumes pending nodes using the current session's model runtime. Completed nodes are
+not repeated. Runs are accessible only from their owner session and resume only under the same
+workspace and access mode. Recovery is at-least-once for an interrupted worker: if it performed a
+side effect but stopped before recording its result, that node may run again. Worker instructions
+should therefore make writes idempotent when background recovery is expected.
+
+Multi-agent execution is disabled by default. Enable it and set conservative resource limits:
+
+```json
+{
+  "tools": {
+    "restrictToWorkspace": true,
+    "multiagent": {
+      "enable": true,
+      "maxTasks": 8,
+      "maxConcurrency": 3,
+      "maxIterationsPerTask": 40,
+      "maxTotalTokens": 100000,
+      "maxStoredRuns": 200,
+      "taskTimeoutSeconds": 300,
+      "maxDelegationDepth": 2,
+      "maxMessageChars": 4000,
+      "serializeWrites": true
+    }
+  }
+}
+```
+
+The built-in capability profiles are:
+
+| Profile | Default capability |
+|---------|--------------------|
+| `research` | Workspace reads, code search, and web tools. |
+| `review` | Workspace reads and code search without web or write access. |
+| `implement` | All tools available in subagent scope; write-capable runs are serialized. |
+| `general` | All tools available in subagent scope; write-capable runs are serialized. |
+
+The `researchTools` and `reviewTools` lists may further reduce their available tools. Write tools
+are always removed from these read-only profiles even if their names are added to the lists.
+
+Workers can exchange bounded messages with `team_send` and `team_receive`, inspect the live graph
+with `team_task_status`, and add necessary downstream work with `team_delegate`. Peer messages are
+injected at the recipient's next runner checkpoint and are explicitly marked as untrusted data.
+Delegated tasks always depend on the delegating task and start after it finishes; this prevents
+parent/child deadlocks even when team concurrency is one.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `tools.multiagent.enable` | `false` | Register `team_run` and the background team lifecycle tools. |
+| `tools.multiagent.maxTasks` | `8` | Maximum nodes accepted in one task graph. |
+| `tools.multiagent.maxConcurrency` | `3` | Maximum workers running concurrently. A tool call may lower but not raise this value. |
+| `tools.multiagent.maxIterationsPerTask` | `40` | AgentRunner iteration limit for each worker. |
+| `tools.multiagent.maxToolResultChars` | `16000` | Maximum normalized tool-result size passed to a worker model. |
+| `tools.multiagent.maxTotalTokens` | `100000` | Shared token budget across all workers in a run. |
+| `tools.multiagent.maxStoredRuns` | `200` | Maximum durable run records. Old terminal runs are pruned first; active runs are never deleted. |
+| `tools.multiagent.taskTimeoutSeconds` | `300` | Wall-clock timeout for each task. |
+| `tools.multiagent.maxDependencyChars` | `12000` | Maximum dependency-result context supplied to a downstream worker. |
+| `tools.multiagent.maxDelegationDepth` | `2` | Maximum number of dynamic delegation generations. Set to `0` to disable delegation. |
+| `tools.multiagent.maxMessageChars` | `4000` | Maximum size of one peer-to-peer team message. |
+| `tools.multiagent.serializeWrites` | `true` | Serialize `implement` and `general` workers. |
+| `tools.multiagent.failOnToolError` | `true` | Stop a worker when one of its tool calls fails. |
+
+
 ## Subagent Concurrency
 
 By default, nanobot only allows one spawned subagent at a time. When the limit is reached, the `spawn` tool returns an error so the agent can decide to wait or rearrange its work. This protects local LLM servers from loading multiple KV caches at once. If your provider can handle more parallel work, raise the limit:
