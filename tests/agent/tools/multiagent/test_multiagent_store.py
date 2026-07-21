@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import time
+
+import pytest
+
 from nanobot.agent.tools.multiagent.models import TeamTaskSpec
 from nanobot.agent.tools.multiagent.state import TeamRunState
-from nanobot.agent.tools.multiagent.store import TeamRunStore
+from nanobot.agent.tools.multiagent.store import TeamRunLeaseError, TeamRunStore
 
 
 def _snapshot() -> dict:
@@ -70,3 +74,67 @@ def test_store_prunes_old_terminal_runs_but_keeps_active_runs(tmp_path) -> None:
     assert store.get("old") is None
     assert store.get("new") is not None
     assert store.get("third") is not None
+
+
+def test_live_process_lease_prevents_second_store_from_reclaiming_run(tmp_path) -> None:
+    path = tmp_path / "runs.sqlite3"
+    first = TeamRunStore(path, lease_seconds=1)
+    first.create(
+        run_id="run-1",
+        owner_session_key="cli:one",
+        goal="goal",
+        workspace_path=str(tmp_path),
+        access_mode="restricted",
+        max_concurrency=1,
+        snapshot=_snapshot(),
+        runner_id="process-one",
+    )
+    first.claim("run-1", "process-one")
+
+    second = TeamRunStore(path, lease_seconds=1)
+
+    assert second.get("run-1").status == "running"
+    with pytest.raises(TeamRunLeaseError, match="another process"):
+        second.claim("run-1", "process-two")
+
+
+def test_expired_process_lease_is_recoverable(tmp_path) -> None:
+    path = tmp_path / "runs.sqlite3"
+    first = TeamRunStore(path, lease_seconds=0.01)
+    first.create(
+        run_id="run-1",
+        owner_session_key="cli:one",
+        goal="goal",
+        workspace_path=str(tmp_path),
+        access_mode="restricted",
+        max_concurrency=1,
+        snapshot=_snapshot(),
+        runner_id="process-one",
+    )
+    first.claim("run-1", "process-one")
+    time.sleep(0.02)
+
+    second = TeamRunStore(path, lease_seconds=0.01)
+
+    assert second.get("run-1").status == "paused"
+    second.claim("run-1", "process-two")
+    assert second.get("run-1").runner_id == "process-two"
+
+
+def test_store_releases_sqlite_file_handles(tmp_path) -> None:
+    path = tmp_path / "runs.sqlite3"
+    store = TeamRunStore(path)
+    store.create(
+        run_id="run-1",
+        owner_session_key="cli:one",
+        goal="goal",
+        workspace_path=str(tmp_path),
+        access_mode="restricted",
+        max_concurrency=1,
+        snapshot=_snapshot(),
+    )
+    assert store.get("run-1") is not None
+
+    path.unlink()
+
+    assert not path.exists()

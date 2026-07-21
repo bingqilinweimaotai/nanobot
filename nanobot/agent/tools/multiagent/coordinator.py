@@ -96,6 +96,8 @@ class TeamCoordinator:
         write_profiles: set[str],
         max_delegation_depth: int = 0,
         max_message_chars: int = 4_000,
+        worker_semaphore: asyncio.Semaphore | None = None,
+        write_lock: asyncio.Lock | None = None,
     ) -> None:
         self.max_tasks = max_tasks
         self.max_concurrency = max_concurrency
@@ -105,6 +107,8 @@ class TeamCoordinator:
         self.write_profiles = set(write_profiles)
         self.max_delegation_depth = max_delegation_depth
         self.max_message_chars = max_message_chars
+        self.worker_semaphore = worker_semaphore
+        self.write_lock = write_lock
 
     async def run(
         self,
@@ -135,7 +139,7 @@ class TeamCoordinator:
             )
         run_id = state.run_id
         semaphore = asyncio.Semaphore(self.max_concurrency)
-        write_lock = asyncio.Lock()
+        write_lock = self.write_lock or asyncio.Lock()
         scheduled: dict[str, asyncio.Task[TeamTaskResult]] = {}
 
         def finish(result: TeamTaskResult) -> TeamTaskResult:
@@ -164,33 +168,42 @@ class TeamCoordinator:
                     error=f"blocked by unsuccessful dependencies: {detail}",
                 ))
 
-            async with semaphore:
+            async def invoke_worker() -> TeamTaskResult:
                 state.mark_running(task.task_id)
                 try:
-                    if self.serialize_writes and task.capability_profile in self.write_profiles:
-                        async with write_lock:
-                            async with asyncio.timeout(self.task_timeout_s):
-                                return finish(await worker(state, goal, task, dependency_results))
                     async with asyncio.timeout(self.task_timeout_s):
-                        return finish(await worker(state, goal, task, dependency_results))
+                        result = await worker(state, goal, task, dependency_results)
                 except TimeoutError:
-                    return finish(TeamTaskResult(
+                    result = TeamTaskResult(
                         task_id=task.task_id,
                         role=task.role,
                         status=TeamTaskStatus.FAILED,
                         stop_reason="timeout",
                         error=f"task exceeded timeout of {self.task_timeout_s:g}s",
-                    ))
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return finish(TeamTaskResult(
+                    result = TeamTaskResult(
                         task_id=task.task_id,
                         role=task.role,
                         status=TeamTaskStatus.FAILED,
                         stop_reason="error",
                         error=f"{type(exc).__name__}: {exc}",
-                    ))
+                    )
+                return finish(result)
+
+            async def run_with_limits() -> TeamTaskResult:
+                async with semaphore:
+                    if self.worker_semaphore is None:
+                        return await invoke_worker()
+                    async with self.worker_semaphore:
+                        return await invoke_worker()
+
+            if self.serialize_writes and task.capability_profile in self.write_profiles:
+                async with write_lock:
+                    return await run_with_limits()
+            return await run_with_limits()
 
         try:
             while True:
@@ -205,13 +218,18 @@ class TeamCoordinator:
                     if len(scheduled) == len(state.tasks):
                         break
                     continue
-                await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for completed in done:
+                    if completed.cancelled():
+                        raise asyncio.CancelledError
+                    if error := completed.exception():
+                        raise error
             ordered_tasks = state.tasks
             results = await asyncio.gather(*(
                 scheduled[task.task_id]
                 for task in ordered_tasks
             ))
-        except asyncio.CancelledError:
+        except BaseException:
             for scheduled_task in scheduled.values():
                 scheduled_task.cancel()
             await asyncio.gather(*scheduled.values(), return_exceptions=True)

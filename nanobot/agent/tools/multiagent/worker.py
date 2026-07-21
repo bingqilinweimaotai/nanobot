@@ -7,7 +7,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.context import (
     RequestContext,
@@ -56,14 +56,22 @@ class TeamTokenBudget:
                     f"team token budget exceeded ({self.used}/{self.limit})"
                 )
 
+    async def is_exhausted(self) -> bool:
+        async with self._lock:
+            return self.used >= self.limit
+
 
 class _TeamBudgetHook(AgentHook):
-    def __init__(self, budget: TeamTokenBudget) -> None:
+    def __init__(self, budget: TeamTokenBudget, state: TeamRunState, task_id: str) -> None:
         super().__init__(reraise=True)
         self.budget = budget
         self.usage: dict[str, int] = {}
+        self.state = state
+        self.task_id = task_id
 
     async def after_iteration(self, context: AgentHookContext) -> None:
+        if context.stop_reason is not None:
+            self.state.mark_finishing(self.task_id)
         for key, value in context.usage.items():
             try:
                 self.usage[key] = self.usage.get(key, 0) + int(value)
@@ -74,6 +82,12 @@ class _TeamBudgetHook(AgentHook):
             + context.usage.get("completion_tokens", 0)
         )
         await self.budget.consume(int(amount or 0))
+
+    async def after_run(self, context: AgentRunHookContext) -> None:
+        self.state.mark_finishing(self.task_id)
+
+    async def on_finally(self, context: AgentRunHookContext) -> None:
+        self.state.mark_finishing(self.task_id)
 
 
 class TeamWorkerRunner:
@@ -94,11 +108,9 @@ class TeamWorkerRunner:
         self.exec_session_manager = exec_session_manager or ExecSessionManager()
 
     def _worker_tools_config(self, restrict_to_workspace: bool) -> ToolsConfig:
-        return ToolsConfig(
-            exec=self.tools_config.exec,
-            web=self.tools_config.web,
-            file=self.tools_config.file,
-            restrict_to_workspace=restrict_to_workspace,
+        return self.tools_config.model_copy(
+            deep=True,
+            update={"restrict_to_workspace": restrict_to_workspace},
         )
 
     def build_tools(
@@ -145,6 +157,7 @@ class TeamWorkerRunner:
                 "role": result.role,
                 "status": result.status.value,
                 "content": result.content,
+                "lateMessages": result.late_messages,
             }
             for task_id, result in dependencies.items()
         }
@@ -207,7 +220,7 @@ class TeamWorkerRunner:
         workspace_token = (
             bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
         )
-        hook = _TeamBudgetHook(budget)
+        hook = _TeamBudgetHook(budget, state, task.task_id)
 
         async def drain_team_messages(*, limit: int = 3) -> list[dict[str, str]]:
             messages = state.drain_messages(task.task_id, limit=limit)
@@ -256,7 +269,7 @@ class TeamWorkerRunner:
                 reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
 
-        failed = result.stop_reason in {"error", "max_iterations", "tool_error"}
+        failed = result.stop_reason != "completed" or result.error is not None
         return TeamTaskResult(
             task_id=task.task_id,
             role=task.role,

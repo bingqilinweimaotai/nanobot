@@ -5,6 +5,7 @@ import json
 import time
 import uuid
 import warnings
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -138,6 +139,8 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
+        self._worker_slots = asyncio.Semaphore(self.max_concurrent_subagents)
+        self._worker_capacity = self.max_concurrent_subagents
         self.fail_on_tool_error = (
             fail_on_tool_error
             if fail_on_tool_error is not None
@@ -187,12 +190,24 @@ class SubagentManager:
 
     def _subagent_tools_config(self) -> ToolsConfig:
         """Build a ToolsConfig scoped for subagent use."""
-        return ToolsConfig(
-            exec=self.tools_config.exec,
-            web=self.tools_config.web,
-            file=self.tools_config.file,
-            restrict_to_workspace=self.restrict_to_workspace,
+        return self.tools_config.model_copy(
+            deep=True,
+            update={"restrict_to_workspace": self.restrict_to_workspace},
         )
+
+    @asynccontextmanager
+    async def worker_slot(self):
+        """Share the configured agent-worker capacity with other edge coordinators."""
+        async with self._worker_slots:
+            yield
+
+    def ensure_worker_capacity(self, capacity: int) -> None:
+        """Increase the shared edge-worker pool when another enabled feature allows more."""
+        if capacity <= self._worker_capacity:
+            return
+        for _ in range(capacity - self._worker_capacity):
+            self._worker_slots.release()
+        self._worker_capacity = capacity
 
     def _build_tools(
         self,
@@ -246,18 +261,20 @@ class SubagentManager:
         )
         self._task_statuses[task_id] = status
 
-        bg_task = asyncio.create_task(
-            self._run_subagent(
-                task_id,
-                task,
-                display_label,
-                origin,
-                status,
-                runtime,
-                origin_message_id,
-                workspace_scope,
-            )
-        )
+        async def run_with_slot() -> None:
+            async with self.worker_slot():
+                await self._run_subagent(
+                    task_id,
+                    task,
+                    display_label,
+                    origin,
+                    status,
+                    runtime,
+                    origin_message_id,
+                    workspace_scope,
+                )
+
+        bg_task = asyncio.create_task(run_with_slot())
         self._running_tasks[task_id] = bg_task
         if session_key:
             self._session_tasks.setdefault(session_key, set()).add(task_id)

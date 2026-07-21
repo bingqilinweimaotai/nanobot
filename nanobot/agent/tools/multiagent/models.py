@@ -75,6 +75,7 @@ class TeamTaskResult:
     tools_used: list[str] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
     error: str | None = None
+    late_messages: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> TeamTaskResult:
@@ -91,6 +92,10 @@ class TeamTaskResult:
             tools_used=[str(item) for item in payload.get("toolsUsed", [])],
             usage={str(key): int(value) for key, value in payload.get("usage", {}).items()},
             error=str(payload["error"]) if payload.get("error") is not None else None,
+            late_messages=[
+                {str(key): str(value) for key, value in message.items()}
+                for message in payload.get("lateMessages", [])
+            ],
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -106,6 +111,8 @@ class TeamTaskResult:
             payload["stopReason"] = self.stop_reason
         if self.error:
             payload["error"] = self.error
+        if self.late_messages:
+            payload["lateMessages"] = list(self.late_messages)
         return payload
 
 

@@ -14,6 +14,7 @@ from nanobot.agent.tools.multiagent.models import (
     TeamTaskSpec,
     TeamTaskStatus,
 )
+from nanobot.agent.tools.multiagent.state import TeamRunState
 
 
 def _task(
@@ -171,6 +172,45 @@ async def test_cancellation_propagates_to_running_workers() -> None:
     with pytest.raises(asyncio.CancelledError):
         await run
     assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_unhandled_task_failure_cancels_sibling_workers() -> None:
+    tasks = [_task("a"), _task("b")]
+    sibling_entered = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    state = TeamRunState(
+        run_id="run-1",
+        tasks=tasks,
+        max_tasks=8,
+        max_delegation_depth=0,
+        capability_profiles={"research"},
+        max_message_chars=100,
+    )
+
+    def fail_checkpoint(changed: TeamRunState) -> None:
+        if changed.result_for("a") is not None:
+            raise OSError("checkpoint unavailable")
+
+    state.set_on_change(fail_checkpoint)
+
+    async def worker(_state, _goal, task, _dependencies):
+        if task.task_id == "a":
+            await sibling_entered.wait()
+            return TeamTaskResult(task.task_id, task.role, TeamTaskStatus.COMPLETED)
+        sibling_entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    with pytest.raises(OSError, match="checkpoint unavailable"):
+        await asyncio.wait_for(
+            _coordinator().run("goal", tasks, worker, state=state),
+            timeout=1,
+        )
+    assert sibling_cancelled.is_set()
 
 
 @pytest.mark.asyncio

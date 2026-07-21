@@ -13,6 +13,7 @@ class MultiAgentToolConfig(Base):
     enable: bool = False
     max_tasks: int = Field(default=8, ge=1, le=32)
     max_concurrency: int = Field(default=3, ge=1, le=16)
+    max_active_runs: int = Field(default=4, ge=1, le=32)
     max_iterations_per_task: int = Field(default=40, ge=1, le=200)
     max_tool_result_chars: int = Field(default=16_000, ge=1_000, le=128_000)
     max_total_tokens: int = Field(default=100_000, ge=1_000)
@@ -28,7 +29,7 @@ class MultiAgentToolConfig(Base):
         "find_files",
         "list_dir",
         "read_file",
-        "search_files",
+        "grep",
         "web_fetch",
         "web_search",
     ])
@@ -36,7 +37,7 @@ class MultiAgentToolConfig(Base):
         "find_files",
         "list_dir",
         "read_file",
-        "search_files",
+        "grep",
     ])
 
     @property

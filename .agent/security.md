@@ -27,3 +27,12 @@ HTTP/SSE MCP transports are part of this boundary: validate configured MCP URLs 
 `tools/sandbox.py` provides optional command wrapping. The only backend currently shipped is `bwrap` (bubblewrap), intended for containerized deployments. On Windows and bare-metal Linux without `bwrap`, commands run in the native shell with workspace restriction as an application-level guard only.
 
 **Rule**: If adding a new sandbox backend, implement `_wrap_<name>(command, workspace, cwd) -> str` and register it in `_BACKENDS`.
+
+## Workspace-Owned Runtime State
+
+Conversation sessions, memory, cron data, and multi-agent coordination records are stored under
+the configured workspace. They therefore share the workspace trust boundary: a worker with an
+`implement` or `general` capability profile can modify them just as it can modify project files.
+Use read-only capability profiles for untrusted investigation. Moving coordination data outside
+the workspace would require a consistent control-plane boundary for all workspace-owned runtime
+state rather than a one-off exception for one tool.

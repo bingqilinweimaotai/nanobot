@@ -22,6 +22,86 @@ def _task(task_id: str) -> TeamTaskSpec:
     return TeamTaskSpec(task_id, "researcher", f"run {task_id}")
 
 
+def test_finishing_task_rejects_late_messages() -> None:
+    state = TeamRunState(
+        run_id="run-1",
+        tasks=[_task("a"), _task("b")],
+        max_tasks=8,
+        max_delegation_depth=2,
+        capability_profiles={"research"},
+        max_message_chars=100,
+    )
+    state.mark_running("b")
+    state.mark_finishing("b")
+
+    with pytest.raises(TeamCollaborationError, match="already finished"):
+        state.send_message(sender_id="a", recipient_id="b", content="too late")
+
+
+def test_message_racing_with_terminal_record_is_preserved_in_result() -> None:
+    state = TeamRunState(
+        run_id="run-1",
+        tasks=[_task("a"), _task("b")],
+        max_tasks=8,
+        max_delegation_depth=2,
+        capability_profiles={"research"},
+        max_message_chars=100,
+    )
+    state.mark_running("b")
+    state.send_message(sender_id="a", recipient_id="b", content="last evidence")
+    result = TeamTaskResult("b", "researcher", TeamTaskStatus.COMPLETED, content="answer")
+
+    state.record_result(result)
+
+    assert result.late_messages == [{
+        "senderId": "a",
+        "recipientId": "b",
+        "content": "last evidence",
+    }]
+    assert state.to_snapshot()["mailboxes"]["b"] == []
+
+
+def test_late_messages_survive_result_serialization() -> None:
+    result = TeamTaskResult(
+        "b",
+        "researcher",
+        TeamTaskStatus.COMPLETED,
+        late_messages=[{
+            "senderId": "a",
+            "recipientId": "b",
+            "content": "last evidence",
+        }],
+    )
+
+    restored = TeamTaskResult.from_payload(result.to_payload())
+
+    assert restored.late_messages == result.late_messages
+
+
+def test_resume_uses_current_policy_limits() -> None:
+    original = TeamRunState(
+        run_id="run-1",
+        tasks=[_task("a")],
+        max_tasks=8,
+        max_delegation_depth=3,
+        capability_profiles={"research", "review"},
+        max_message_chars=4_000,
+    )
+
+    restored = TeamRunState.from_snapshot(
+        original.to_snapshot(),
+        max_tasks=2,
+        max_delegation_depth=1,
+        capability_profiles={"research"},
+        max_message_chars=200,
+    )
+
+    assert restored.max_tasks == 2
+    assert restored.max_delegation_depth == 1
+    assert restored.capability_profiles == {"research"}
+    assert restored.max_message_chars == 200
+
+
 def _state(*tasks: TeamTaskSpec, max_tasks: int = 8, max_depth: int = 2) -> TeamRunState:
     return TeamRunState(
         run_id="run-1",

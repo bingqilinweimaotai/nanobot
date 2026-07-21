@@ -14,7 +14,7 @@ def team_tasks_schema() -> ArraySchema:
                 description="Task ids whose successful results are required.",
             ),
             capabilityProfile=StringSchema(
-                "Admin-defined capability profile.",
+                "Built-in capability profile controlling the worker tool set.",
                 enum=["general", "implement", "research", "review"],
             ),
             required=["id", "role", "instruction"],

@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.multiagent.config import MultiAgentToolConfig
-from nanobot.agent.tools.multiagent.coordinator import TeamCoordinator, TeamPlanError
+from nanobot.agent.tools.multiagent.coordinator import TeamPlanError
 from nanobot.agent.tools.multiagent.models import TeamTaskSpec
 from nanobot.agent.tools.multiagent.plan_schema import team_tasks_schema
-from nanobot.agent.tools.multiagent.worker import TeamTokenBudget, TeamWorkerRunner
+from nanobot.agent.tools.multiagent.service import TeamRunService, shared_team_run_service
 from nanobot.agent.tools.schema import (
     IntegerSchema,
     StringSchema,
@@ -55,27 +54,22 @@ class TeamRunTool(Tool):
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        return cls(
-            workspace=Path(ctx.workspace),
-            tools_config=ctx.config,
-            config=ctx.config.multiagent,
-        )
+        return cls(shared_team_run_service(ctx))
 
     def __init__(
         self,
-        *,
-        workspace: Path,
-        tools_config: Any,
-        config: MultiAgentToolConfig,
+        service: TeamRunService,
     ) -> None:
-        self.workspace = workspace
-        self.tools_config = tools_config
-        self.config = config
-        self.worker_runner = TeamWorkerRunner(
-            workspace=workspace,
-            tools_config=tools_config,
-            config=config,
-        )
+        self.service = service
+
+    @property
+    def config(self) -> MultiAgentToolConfig:
+        return self.service.config
+
+    @property
+    def worker_runner(self):
+        """Compatibility handle for tests and extensions customizing worker execution."""
+        return self.service.worker_runner
 
     @property
     def name(self) -> str:
@@ -117,33 +111,17 @@ class TeamRunTool(Tool):
             if not isinstance(tasks, list):
                 raise ValueError("tasks must be a list")
             task_specs = [TeamTaskSpec.from_payload(task) for task in tasks]
-            coordinator = TeamCoordinator(
-                max_tasks=self.config.max_tasks,
-                max_concurrency=max_concurrency or self.config.max_concurrency,
-                task_timeout_s=self.config.task_timeout_seconds,
-                serialize_writes=self.config.serialize_writes,
-                capability_profiles=self.config.capability_profiles,
-                write_profiles=self.config.write_profiles,
-                max_delegation_depth=self.config.max_delegation_depth,
-                max_message_chars=self.config.max_message_chars,
+            result = await self.service.run_foreground(
+                goal=goal,
+                tasks=task_specs,
+                request=request,
+                workspace_scope=current_workspace_scope(),
+                max_concurrency=max_concurrency,
             )
-            budget = TeamTokenBudget(self.config.max_total_tokens)
-
-            async def run_worker(state, team_goal, task, dependencies):
-                return await self.worker_runner.run(
-                    state=state,
-                    goal=team_goal,
-                    task=task,
-                    dependencies=dependencies,
-                    runtime=request.runtime,
-                    parent_request=request,
-                    workspace_scope=current_workspace_scope(),
-                    budget=budget,
-                )
-
-            result = await coordinator.run(goal, task_specs, run_worker)
         except TeamPlanError as exc:
             return ToolResult.error(f"Error: invalid team plan: {exc}")
         except ValueError as exc:
             return ToolResult.error(f"Error: invalid team task: {exc}")
+        except RuntimeError as exc:
+            return ToolResult.error(f"Error: team run failed: {exc}")
         return result.to_json()

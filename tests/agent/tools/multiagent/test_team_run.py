@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,6 +10,8 @@ from nanobot.agent.tools.context import RequestContext, ToolContext, request_con
 from nanobot.agent.tools.loader import ToolLoader
 from nanobot.agent.tools.multiagent.config import MultiAgentToolConfig
 from nanobot.agent.tools.multiagent.models import TeamTaskResult, TeamTaskStatus
+from nanobot.agent.tools.multiagent.plan_schema import team_tasks_schema
+from nanobot.agent.tools.multiagent.service import TeamRunService, shared_team_run_service
 from nanobot.agent.tools.multiagent.team_run import TeamRunTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import ToolsConfig
@@ -25,7 +28,11 @@ def _runtime() -> LLMRuntime:
 def _tool(tmp_path, **config_overrides) -> TeamRunTool:
     config = MultiAgentToolConfig(enable=True, **config_overrides)
     tools_config = ToolsConfig(multiagent=config)
-    return TeamRunTool(workspace=tmp_path, tools_config=tools_config, config=config)
+    return TeamRunTool(TeamRunService(
+        workspace=tmp_path,
+        tools_config=tools_config,
+        config=config,
+    ))
 
 
 def test_team_run_is_disabled_by_default(tmp_path) -> None:
@@ -66,6 +73,7 @@ def test_multiagent_config_accepts_camel_case() -> None:
             "enable": True,
             "maxTasks": 4,
             "maxConcurrency": 2,
+            "maxActiveRuns": 3,
             "maxDelegationDepth": 1,
             "maxStoredRuns": 50,
         },
@@ -74,8 +82,17 @@ def test_multiagent_config_accepts_camel_case() -> None:
     assert config.multiagent.enable is True
     assert config.multiagent.max_tasks == 4
     assert config.multiagent.max_concurrency == 2
+    assert config.multiagent.max_active_runs == 3
     assert config.multiagent.max_delegation_depth == 1
     assert config.multiagent.max_stored_runs == 50
+
+
+def test_task_schema_describes_capability_profiles_as_built_in() -> None:
+    schema = team_tasks_schema().to_json_schema()
+
+    profile = schema["items"]["properties"]["capabilityProfile"]
+    assert profile["description"].startswith("Built-in capability profile")
+    assert profile["enum"] == ["general", "implement", "research", "review"]
 
 
 @pytest.mark.asyncio
@@ -89,10 +106,12 @@ async def test_background_lifecycle_tools_share_service(tmp_path) -> None:
     start_tool = registry.get("team_start")
     wait_tool = registry.get("team_wait")
     status_tool = registry.get("team_status")
+    run_tool = registry.get("team_run")
     assert start_tool is not None
     assert wait_tool is not None
     assert status_tool is not None
-    assert start_tool.service is wait_tool.service is status_tool.service
+    assert run_tool is not None
+    assert start_tool.service is wait_tool.service is status_tool.service is run_tool.service
 
     async def worker_result(**kwargs):
         task = kwargs["task"]
@@ -117,6 +136,72 @@ async def test_background_lifecycle_tools_share_service(tmp_path) -> None:
 
     assert finished["status"] == "completed"
     assert status["result"]["tasks"][0]["id"] == "a"
+
+
+def test_new_tool_context_gets_fresh_service_and_current_config(tmp_path) -> None:
+    first_registry = ToolRegistry()
+    first_config = ToolsConfig(
+        multiagent=MultiAgentToolConfig(enable=True, max_concurrency=1),
+    )
+    ToolLoader().load(ToolContext(config=first_config, workspace=str(tmp_path)), first_registry)
+
+    second_registry = ToolRegistry()
+    second_config = ToolsConfig(
+        multiagent=MultiAgentToolConfig(enable=True, max_concurrency=2),
+    )
+    ToolLoader().load(ToolContext(config=second_config, workspace=str(tmp_path)), second_registry)
+
+    first_service = first_registry.get("team_run").service
+    second_service = second_registry.get("team_run").service
+    assert first_service is not second_service
+    assert second_service.config.max_concurrency == 2
+
+
+def test_team_service_joins_subagent_worker_capacity_pool(tmp_path) -> None:
+    class Manager:
+        def __init__(self) -> None:
+            self.capacity = 1
+
+        def ensure_worker_capacity(self, capacity: int) -> None:
+            self.capacity = max(self.capacity, capacity)
+
+        @asynccontextmanager
+        async def worker_slot(self):
+            yield
+
+    manager = Manager()
+    config = ToolsConfig(multiagent=MultiAgentToolConfig(enable=True, max_concurrency=3))
+    context = ToolContext(
+        config=config,
+        workspace=str(tmp_path),
+        subagent_manager=manager,
+    )
+
+    service = shared_team_run_service(context)
+
+    assert manager.capacity == 3
+    assert service.engine.agent_worker_slot == manager.worker_slot
+
+
+def test_agent_loop_wires_one_service_and_shared_worker_capacity(tmp_path) -> None:
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test-model"
+    config = ToolsConfig(multiagent=MultiAgentToolConfig(enable=True, max_concurrency=3))
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        tools_config=config,
+        max_concurrent_subagents=1,
+    )
+
+    assert loop.tools.get("team_run").service is loop.tools.get("team_start").service
+    assert loop.subagents._worker_capacity == 3
 
 
 @pytest.mark.asyncio

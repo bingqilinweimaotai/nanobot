@@ -230,6 +230,28 @@ def test_subagent_default_max_iterations_matches_agent_defaults(tmp_path):
     assert mgr.max_iterations == AgentDefaults().max_tool_iterations
 
 
+def test_subagent_preserves_parent_admin_tool_settings(tmp_path):
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.schema import ToolsConfig
+
+    tools_config = ToolsConfig(webui_allow_local_service_access=False)
+    tools_config.cli_apps.enable = False
+    mgr = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        tools_config=tools_config,
+        restrict_to_workspace=True,
+    )
+
+    scoped = mgr._subagent_tools_config()
+
+    assert scoped.cli_apps.enable is False
+    assert scoped.webui_allow_local_service_access is False
+    assert scoped.restrict_to_workspace is True
+
+
 def test_agent_loop_passes_max_iterations_to_subagents(tmp_path):
     """AgentLoop's configured limit should be shared with spawned subagents."""
     from nanobot.agent.loop import AgentLoop

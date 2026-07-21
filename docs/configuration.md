@@ -2042,7 +2042,8 @@ The optional team tools execute an explicit dependency graph through multiple is
 agents. Independent read-only tasks can run concurrently, while tasks using the
 `implement` or `general` capability profiles are serialized by default to avoid conflicting
 workspace writes. `team_run` waits in the foreground, so `/stop` cancels its coordinator and
-active workers together.
+active workers together. Foreground and background calls use the same execution service, global
+worker limit, write lock, and durable run store.
 
 For work that should continue after the current model turn, use `team_start`. It returns a run id
 immediately; `team_status` polls without changing the run, `team_wait` waits for completion (and
@@ -2051,9 +2052,10 @@ resumes an interrupted run), and `team_cancel` stops it. Background state is sto
 delegations, and unread team messages.
 
 The scheduler remains process-local: it is not a daemon and does not automatically restart model
-work after a gateway restart. On the next startup, interrupted runs become `paused`; calling
-`team_wait` resumes pending nodes using the current session's model runtime. Completed nodes are
-not repeated. Runs are accessible only from their owner session and resume only under the same
+work after a gateway restart. A process lease prevents another gateway using the same workspace
+from reclaiming a live run. After that lease expires, `team_wait` can resume pending nodes using
+the current session's model runtime and current multi-agent limits; completed nodes are not
+repeated, and failed nodes are retained rather than retried. Runs are accessible only from their owner session and resume only under the same
 workspace and access mode. Recovery is at-least-once for an interrupted worker: if it performed a
 side effect but stopped before recording its result, that node may run again. Worker instructions
 should therefore make writes idempotent when background recovery is expected.
@@ -2068,6 +2070,7 @@ Multi-agent execution is disabled by default. Enable it and set conservative res
       "enable": true,
       "maxTasks": 8,
       "maxConcurrency": 3,
+      "maxActiveRuns": 4,
       "maxIterationsPerTask": 40,
       "maxTotalTokens": 100000,
       "maxStoredRuns": 200,
@@ -2095,6 +2098,8 @@ are always removed from these read-only profiles even if their names are added t
 Workers can exchange bounded messages with `team_send` and `team_receive`, inspect the live graph
 with `team_task_status`, and add necessary downstream work with `team_delegate`. Peer messages are
 injected at the recipient's next runner checkpoint and are explicitly marked as untrusted data.
+Messages racing with a recipient's terminal checkpoint are retained as `lateMessages` on that
+task result and included in downstream dependency context instead of being silently dropped.
 Delegated tasks always depend on the delegating task and start after it finishes; this prevents
 parent/child deadlocks even when team concurrency is one.
 
@@ -2102,12 +2107,13 @@ parent/child deadlocks even when team concurrency is one.
 |--------|---------|-------------|
 | `tools.multiagent.enable` | `false` | Register `team_run` and the background team lifecycle tools. |
 | `tools.multiagent.maxTasks` | `8` | Maximum nodes accepted in one task graph. |
-| `tools.multiagent.maxConcurrency` | `3` | Maximum workers running concurrently. A tool call may lower but not raise this value. |
+| `tools.multiagent.maxConcurrency` | `3` | Maximum team workers running concurrently across foreground and background runs in one agent runtime. A tool call may lower its own run but not raise this value. |
+| `tools.multiagent.maxActiveRuns` | `4` | Maximum foreground and background team runs active in one agent runtime. |
 | `tools.multiagent.maxIterationsPerTask` | `40` | AgentRunner iteration limit for each worker. |
 | `tools.multiagent.maxToolResultChars` | `16000` | Maximum normalized tool-result size passed to a worker model. |
 | `tools.multiagent.maxTotalTokens` | `100000` | Shared token budget across all workers in a run. |
-| `tools.multiagent.maxStoredRuns` | `200` | Maximum durable run records. Old terminal runs are pruned first; active runs are never deleted. |
-| `tools.multiagent.taskTimeoutSeconds` | `300` | Wall-clock timeout for each task. |
+| `tools.multiagent.maxStoredRuns` | `200` | Durable retention target. Old terminal runs are pruned when a new run is created; active runs are never deleted, so the store may temporarily exceed this value. |
+| `tools.multiagent.taskTimeoutSeconds` | `300` | Wall-clock timeout for a worker's entire multi-turn lifecycle, including all model and tool calls. A timeout marks the node failed. |
 | `tools.multiagent.maxDependencyChars` | `12000` | Maximum dependency-result context supplied to a downstream worker. |
 | `tools.multiagent.maxDelegationDepth` | `2` | Maximum number of dynamic delegation generations. Set to `0` to disable delegation. |
 | `tools.multiagent.maxMessageChars` | `4000` | Maximum size of one peer-to-peer team message. |
@@ -2118,6 +2124,10 @@ parent/child deadlocks even when team concurrency is one.
 ## Subagent Concurrency
 
 By default, nanobot only allows one spawned subagent at a time. When the limit is reached, the `spawn` tool returns an error so the agent can decide to wait or rearrange its work. This protects local LLM servers from loading multiple KV caches at once. If your provider can handle more parallel work, raise the limit:
+
+When multi-agent teams are enabled, spawned subagents and team workers share an edge-worker pool.
+Its capacity is the higher of `agents.defaults.maxConcurrentSubagents` and
+`tools.multiagent.maxConcurrency`; each mechanism still enforces its own configured limit.
 
 ```json
 {

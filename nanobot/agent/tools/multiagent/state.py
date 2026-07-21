@@ -44,7 +44,7 @@ class TeamRunState:
     operation atomic relative to other workers in the same run.
     """
 
-    _TERMINAL_STATUSES = {"blocked", "completed", "failed"}
+    _TERMINAL_STATUSES = {"blocked", "completed", "failed", "finishing"}
 
     def __init__(
         self,
@@ -89,7 +89,16 @@ class TeamRunState:
             self._statuses[task_id] = "running"
             self._notify_change()
 
+    def mark_finishing(self, task_id: str) -> None:
+        """Close the mailbox once the worker has produced its final response."""
+        if self._statuses.get(task_id) == "running":
+            self._statuses[task_id] = "finishing"
+
     def record_result(self, result: TeamTaskResult) -> None:
+        late_messages = self._mailboxes.get(result.task_id, [])
+        if late_messages:
+            result.late_messages.extend(message.to_payload() for message in late_messages)
+            late_messages.clear()
         self._results[result.task_id] = result
         self._statuses[result.task_id] = result.status.value
         self._notify_change()
@@ -213,6 +222,10 @@ class TeamRunState:
         cls,
         payload: dict[str, Any],
         *,
+        max_tasks: int | None = None,
+        max_delegation_depth: int | None = None,
+        capability_profiles: set[str] | None = None,
+        max_message_chars: int | None = None,
         on_change: Callable[[TeamRunState], None] | None = None,
     ) -> TeamRunState:
         """Restore a checkpoint, returning interrupted workers to pending."""
@@ -221,10 +234,22 @@ class TeamRunState:
         state = cls(
             run_id=str(payload["runId"]),
             tasks=tasks,
-            max_tasks=int(limits["maxTasks"]),
-            max_delegation_depth=int(limits["maxDelegationDepth"]),
-            capability_profiles={str(item) for item in payload.get("capabilityProfiles", [])},
-            max_message_chars=int(limits["maxMessageChars"]),
+            max_tasks=max_tasks if max_tasks is not None else int(limits["maxTasks"]),
+            max_delegation_depth=(
+                max_delegation_depth
+                if max_delegation_depth is not None
+                else int(limits["maxDelegationDepth"])
+            ),
+            capability_profiles=(
+                capability_profiles
+                if capability_profiles is not None
+                else {str(item) for item in payload.get("capabilityProfiles", [])}
+            ),
+            max_message_chars=(
+                max_message_chars
+                if max_message_chars is not None
+                else int(limits["maxMessageChars"])
+            ),
             on_change=on_change,
         )
         raw_depths = payload.get("depths", {})
@@ -235,7 +260,7 @@ class TeamRunState:
         state._statuses = {
             task.task_id: (
                 "pending"
-                if raw_statuses.get(task.task_id, "pending") == "running"
+                if raw_statuses.get(task.task_id, "pending") in {"running", "finishing"}
                 else str(raw_statuses.get(task.task_id, "pending"))
             )
             for task in tasks

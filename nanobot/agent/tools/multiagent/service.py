@@ -1,8 +1,9 @@
-"""Shared lifecycle service for durable background team runs."""
+"""Shared lifecycle service for foreground and durable background team runs."""
 
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
@@ -11,11 +12,16 @@ from loguru import logger
 
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.multiagent.config import MultiAgentToolConfig
-from nanobot.agent.tools.multiagent.coordinator import TeamCoordinator, validate_task_graph
-from nanobot.agent.tools.multiagent.models import TeamTaskSpec
+from nanobot.agent.tools.multiagent.coordinator import validate_task_graph
+from nanobot.agent.tools.multiagent.engine import TeamExecutionEngine, WorkerSlot
+from nanobot.agent.tools.multiagent.models import TeamRunResult, TeamTaskSpec
 from nanobot.agent.tools.multiagent.state import TeamRunState
-from nanobot.agent.tools.multiagent.store import StoredTeamRun, TeamRunStore
-from nanobot.agent.tools.multiagent.worker import TeamTokenBudget, TeamWorkerRunner
+from nanobot.agent.tools.multiagent.store import (
+    StoredTeamRun,
+    TeamRunLeaseError,
+    TeamRunStore,
+)
+from nanobot.agent.tools.multiagent.worker import TeamWorkerRunner
 from nanobot.config.schema import ToolsConfig
 from nanobot.security.workspace_access import (
     WorkspaceScope,
@@ -23,7 +29,6 @@ from nanobot.security.workspace_access import (
 )
 
 _TERMINAL_RUN_STATUSES = {"cancelled", "completed", "failed", "partial"}
-_SERVICES: dict[str, TeamRunService] = {}
 
 
 class TeamRunAccessError(ValueError):
@@ -35,23 +40,31 @@ def request_owner_key(request: RequestContext) -> str:
 
 
 def shared_team_run_service(ctx: Any) -> TeamRunService:
-    """Return one service shared by all team lifecycle tools in a registry."""
+    """Return one service shared by team tools built from the same ToolContext."""
+    service = getattr(ctx, "team_run_service", None)
+    if service is not None:
+        return service
+
     workspace = Path(ctx.workspace).expanduser().resolve(strict=False)
-    key = str(workspace)
-    service = _SERVICES.get(key)
-    if service is None:
-        service = TeamRunService(
-            workspace=workspace,
-            tools_config=ctx.config,
-            config=ctx.config.multiagent,
-            exec_session_manager=getattr(ctx, "exec_session_manager", None),
-        )
-        _SERVICES[key] = service
+    manager = getattr(ctx, "subagent_manager", None)
+    worker_slot: WorkerSlot | None = None
+    if manager is not None and callable(getattr(manager, "worker_slot", None)):
+        ensure_capacity = getattr(manager, "ensure_worker_capacity", None)
+        if callable(ensure_capacity):
+            ensure_capacity(ctx.config.multiagent.max_concurrency)
+        worker_slot = manager.worker_slot
+    service = TeamRunService(
+        workspace=workspace,
+        tools_config=ctx.config,
+        config=ctx.config.multiagent,
+        agent_worker_slot=worker_slot,
+    )
+    ctx.team_run_service = service
     return service
 
 
 class TeamRunService:
-    """Own background tasks and checkpoint them for explicit later resumption."""
+    """Own execution, persistence, cancellation, and resumption for team runs."""
 
     def __init__(
         self,
@@ -59,9 +72,10 @@ class TeamRunService:
         workspace: Path,
         tools_config: ToolsConfig,
         config: MultiAgentToolConfig,
-        exec_session_manager: Any | None = None,
         store: TeamRunStore | None = None,
         worker_runner: TeamWorkerRunner | None = None,
+        engine: TeamExecutionEngine | None = None,
+        agent_worker_slot: WorkerSlot | None = None,
     ) -> None:
         self.workspace = workspace.expanduser().resolve(strict=False)
         self.tools_config = tools_config
@@ -74,8 +88,13 @@ class TeamRunService:
             workspace=self.workspace,
             tools_config=tools_config,
             config=config,
-            exec_session_manager=exec_session_manager,
         )
+        self.engine = engine or TeamExecutionEngine(
+            config=config,
+            worker_runner=self.worker_runner,
+            agent_worker_slot=agent_worker_slot,
+        )
+        self.runner_id = uuid.uuid4().hex
         self._active: dict[str, asyncio.Task[None]] = {}
         self._cancel_requested: set[str] = set()
 
@@ -83,18 +102,6 @@ class TeamRunService:
         return scope or default_workspace_scope(
             self.workspace,
             self.tools_config.restrict_to_workspace,
-        )
-
-    def _coordinator(self, max_concurrency: int) -> TeamCoordinator:
-        return TeamCoordinator(
-            max_tasks=self.config.max_tasks,
-            max_concurrency=max_concurrency,
-            task_timeout_s=self.config.task_timeout_seconds,
-            serialize_writes=self.config.serialize_writes,
-            capability_profiles=self.config.capability_profiles,
-            write_profiles=self.config.write_profiles,
-            max_delegation_depth=self.config.max_delegation_depth,
-            max_message_chars=self.config.max_message_chars,
         )
 
     def _validate_concurrency(self, max_concurrency: int | None) -> int:
@@ -107,6 +114,14 @@ class TeamRunService:
                 f"({concurrency}/{self.config.max_concurrency})"
             )
         return concurrency
+
+    def _validate_active_capacity(self) -> None:
+        active = sum(1 for task in self._active.values() if not task.done())
+        if active >= self.config.max_active_runs:
+            raise ValueError(
+                "active team run limit reached "
+                f"({active}/{self.config.max_active_runs})"
+            )
 
     def _owned(self, run_id: str, owner_session_key: str) -> StoredTeamRun:
         stored = self.store.get(run_id)
@@ -125,6 +140,83 @@ class TeamRunService:
                 "team run must be resumed from its original workspace and access mode"
             )
 
+    def _restore_state(self, stored: StoredTeamRun) -> TeamRunState:
+        return TeamRunState.from_snapshot(
+            stored.snapshot,
+            max_tasks=self.config.max_tasks,
+            max_delegation_depth=self.config.max_delegation_depth,
+            capability_profiles=self.config.capability_profiles,
+            max_message_chars=self.config.max_message_chars,
+        )
+
+    def _checkpoint_callback(self, run_id: str):
+        def checkpoint(changed: TeamRunState) -> None:
+            self.store.checkpoint(
+                run_id,
+                snapshot=changed.to_snapshot(),
+                status="running",
+                runner_id=self.runner_id,
+            )
+
+        return checkpoint
+
+    async def _start_run(
+        self,
+        *,
+        goal: str,
+        tasks: list[TeamTaskSpec],
+        request: RequestContext,
+        workspace_scope: WorkspaceScope | None,
+        max_concurrency: int | None,
+    ) -> tuple[StoredTeamRun, asyncio.Task[None]]:
+        if request.runtime is None:
+            raise ValueError("team execution requires an active model runtime")
+        concurrency = self._validate_concurrency(max_concurrency)
+        validate_task_graph(
+            tasks,
+            max_tasks=self.config.max_tasks,
+            capability_profiles=self.config.capability_profiles,
+        )
+        if not goal.strip():
+            raise ValueError("team run requires a non-empty goal")
+        self._validate_active_capacity()
+
+        scope = self._scope(workspace_scope)
+        owner = request_owner_key(request)
+        state: TeamRunState | None = None
+        run_id = ""
+        for _ in range(3):
+            run_id = uuid.uuid4().hex[:12]
+            state = TeamRunState(
+                run_id=run_id,
+                tasks=tasks,
+                max_tasks=self.config.max_tasks,
+                max_delegation_depth=self.config.max_delegation_depth,
+                capability_profiles=self.config.capability_profiles,
+                max_message_chars=self.config.max_message_chars,
+            )
+            try:
+                self.store.create(
+                    run_id=run_id,
+                    owner_session_key=owner,
+                    goal=goal.strip(),
+                    workspace_path=str(scope.project_path),
+                    access_mode=scope.access_mode,
+                    max_concurrency=concurrency,
+                    snapshot=state.to_snapshot(),
+                    runner_id=self.runner_id,
+                )
+                break
+            except sqlite3.IntegrityError:
+                state = None
+        if state is None:
+            raise RuntimeError("could not allocate a unique team run id")
+
+        state.set_on_change(self._checkpoint_callback(run_id))
+        stored = self._owned(run_id, owner)
+        task = self._launch(stored=stored, state=state, request=request, scope=scope)
+        return self._owned(run_id, owner), task
+
     async def start(
         self,
         *,
@@ -134,50 +226,48 @@ class TeamRunService:
         workspace_scope: WorkspaceScope | None,
         max_concurrency: int | None = None,
     ) -> StoredTeamRun:
-        if request.runtime is None:
-            raise ValueError("team_start requires an active model runtime")
-        concurrency = self._validate_concurrency(max_concurrency)
-        validate_task_graph(
-            tasks,
-            max_tasks=self.config.max_tasks,
-            capability_profiles=self.config.capability_profiles,
-        )
-        if not goal.strip():
-            raise ValueError("team run requires a non-empty goal")
-
-        scope = self._scope(workspace_scope)
-        run_id = uuid.uuid4().hex[:12]
-        state = TeamRunState(
-            run_id=run_id,
+        """Start a durable run and return without waiting for its workers."""
+        stored, _ = await self._start_run(
+            goal=goal,
             tasks=tasks,
-            max_tasks=self.config.max_tasks,
-            max_delegation_depth=self.config.max_delegation_depth,
-            capability_profiles=self.config.capability_profiles,
-            max_message_chars=self.config.max_message_chars,
-        )
-        self.store.create(
-            run_id=run_id,
-            owner_session_key=request_owner_key(request),
-            goal=goal.strip(),
-            workspace_path=str(scope.project_path),
-            access_mode=scope.access_mode,
-            max_concurrency=concurrency,
-            snapshot=state.to_snapshot(),
-        )
-        state.set_on_change(
-            lambda changed: self.store.checkpoint(
-                run_id,
-                snapshot=changed.to_snapshot(),
-                status="running",
-            )
-        )
-        self._launch(
-            stored=self._owned(run_id, request_owner_key(request)),
-            state=state,
             request=request,
-            scope=scope,
+            workspace_scope=workspace_scope,
+            max_concurrency=max_concurrency,
         )
-        return self._owned(run_id, request_owner_key(request))
+        return stored
+
+    async def run_foreground(
+        self,
+        *,
+        goal: str,
+        tasks: list[TeamTaskSpec],
+        request: RequestContext,
+        workspace_scope: WorkspaceScope | None,
+        max_concurrency: int | None = None,
+    ) -> TeamRunResult:
+        """Run through the same durable lifecycle while the caller waits."""
+        stored, task = await self._start_run(
+            goal=goal,
+            tasks=tasks,
+            request=request,
+            workspace_scope=workspace_scope,
+            max_concurrency=max_concurrency,
+        )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling():
+                await self.cancel(stored.run_id, request_owner_key(request))
+                raise
+            finished = self._owned(stored.run_id, request_owner_key(request))
+            raise RuntimeError(
+                finished.error or f"team run stopped unexpectedly ({finished.status})"
+            ) from None
+        finished = self._owned(stored.run_id, request_owner_key(request))
+        if finished.result is None:
+            raise RuntimeError(finished.error or "team run ended without a result")
+        return finished.result
 
     def _launch(
         self,
@@ -190,6 +280,11 @@ class TeamRunService:
         existing = self._active.get(stored.run_id)
         if existing is not None and not existing.done():
             return existing
+        self._validate_active_capacity()
+        try:
+            self.store.claim(stored.run_id, self.runner_id)
+        except TeamRunLeaseError as exc:
+            raise TeamRunAccessError(str(exc)) from exc
         task = asyncio.create_task(
             self._run(stored=stored, state=state, request=request, scope=scope),
             name=f"nanobot-team-run-{stored.run_id}",
@@ -204,7 +299,7 @@ class TeamRunService:
             except asyncio.CancelledError:
                 return
             if error is not None:
-                logger.error("Background team run {} failed: {}", stored.run_id, error)
+                logger.error("Team run {} failed: {}", stored.run_id, error)
 
         task.add_done_callback(cleanup)
         return task
@@ -223,6 +318,25 @@ class TeamRunService:
             )
         return total
 
+    async def _heartbeat(
+        self,
+        run_id: str,
+        owner_task: asyncio.Task[Any],
+        lease_lost: asyncio.Event,
+    ) -> None:
+        interval = max(0.001, self.store.lease_seconds / 3)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                self.store.heartbeat(run_id, self.runner_id)
+        except TeamRunLeaseError:
+            lease_lost.set()
+            owner_task.cancel()
+        except Exception:
+            logger.exception("Team run {} heartbeat failed; stopping its workers", run_id)
+            lease_lost.set()
+            owner_task.cancel()
+
     async def _run(
         self,
         *,
@@ -232,49 +346,62 @@ class TeamRunService:
         scope: WorkspaceScope,
     ) -> None:
         run_id = stored.run_id
-        self.store.checkpoint(run_id, snapshot=state.to_snapshot(), status="running")
-        budget = TeamTokenBudget(self.config.max_total_tokens)
-        budget.used = self._consumed_tokens(state)
-        coordinator = self._coordinator(stored.max_concurrency)
-
-        async def run_worker(team_state, team_goal, task, dependencies):
-            return await self.worker_runner.run(
-                state=team_state,
-                goal=team_goal,
-                task=task,
-                dependencies=dependencies,
-                runtime=request.runtime,
-                parent_request=request,
-                workspace_scope=scope,
-                budget=budget,
-            )
-
+        lease_lost = asyncio.Event()
+        owner_task = asyncio.current_task()
+        assert owner_task is not None
+        heartbeat = asyncio.create_task(
+            self._heartbeat(run_id, owner_task, lease_lost),
+            name=f"nanobot-team-heartbeat-{run_id}",
+        )
         try:
-            result = await coordinator.run(
-                stored.goal,
-                state.tasks,
-                run_worker,
+            self.store.checkpoint(
+                run_id,
+                snapshot=state.to_snapshot(),
+                status="running",
+                runner_id=self.runner_id,
+            )
+            result = await self.engine.run(
+                goal=stored.goal,
                 state=state,
+                request=request,
+                workspace_scope=scope,
+                max_concurrency=min(stored.max_concurrency, self.config.max_concurrency),
+                consumed_tokens=self._consumed_tokens(state),
             )
         except asyncio.CancelledError:
-            status = "cancelled" if run_id in self._cancel_requested else "paused"
-            self.store.finish(run_id, status=status, snapshot=state.to_snapshot())
+            if not lease_lost.is_set():
+                status = "cancelled" if run_id in self._cancel_requested else "paused"
+                self.store.finish(
+                    run_id,
+                    status=status,
+                    snapshot=state.to_snapshot(),
+                    runner_id=self.runner_id,
+                )
             raise
+        except TeamRunLeaseError:
+            logger.warning("Stopped team run {} after losing its process lease", run_id)
         except Exception as exc:
-            self.store.finish(
-                run_id,
-                status="failed",
-                snapshot=state.to_snapshot(),
-                error=f"{type(exc).__name__}: {exc}",
-            )
+            try:
+                self.store.finish(
+                    run_id,
+                    status="failed",
+                    snapshot=state.to_snapshot(),
+                    error=f"{type(exc).__name__}: {exc}",
+                    runner_id=self.runner_id,
+                )
+            except TeamRunLeaseError:
+                logger.warning("Could not persist failure for team run {} after lease loss", run_id)
         else:
             self.store.finish(
                 run_id,
                 status=result.status,
                 snapshot=state.to_snapshot(),
                 result=result,
+                runner_id=self.runner_id,
             )
         finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
             self._cancel_requested.discard(run_id)
 
     def status(self, run_id: str, owner_session_key: str) -> StoredTeamRun:
@@ -299,14 +426,8 @@ class TeamRunService:
 
         task = self._active.get(run_id)
         if task is None or task.done():
-            state = TeamRunState.from_snapshot(stored.snapshot)
-            state.set_on_change(
-                lambda changed: self.store.checkpoint(
-                    run_id,
-                    snapshot=changed.to_snapshot(),
-                    status="running",
-                )
-            )
+            state = self._restore_state(stored)
+            state.set_on_change(self._checkpoint_callback(run_id))
             task = self._launch(stored=stored, state=state, request=request, scope=scope)
         try:
             if timeout_seconds is None:
@@ -322,14 +443,28 @@ class TeamRunService:
         if stored.status in _TERMINAL_RUN_STATUSES:
             return stored
         task = self._active.get(run_id)
-        if task is None or task.done():
-            self.store.finish(
-                run_id,
-                status="cancelled",
-                snapshot=stored.snapshot,
-            )
-        else:
+        if task is not None and not task.done():
             self._cancel_requested.add(run_id)
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            current = self._owned(run_id, owner_session_key)
+            if current.status not in _TERMINAL_RUN_STATUSES:
+                self.store.finish(
+                    run_id,
+                    status="cancelled",
+                    snapshot=current.snapshot,
+                    runner_id=self.runner_id,
+                )
+            self._cancel_requested.discard(run_id)
+        else:
+            try:
+                self.store.claim(run_id, self.runner_id)
+                self.store.finish(
+                    run_id,
+                    status="cancelled",
+                    snapshot=stored.snapshot,
+                    runner_id=self.runner_id,
+                )
+            except TeamRunLeaseError as exc:
+                raise TeamRunAccessError(str(exc)) from exc
         return self._owned(run_id, owner_session_key)
