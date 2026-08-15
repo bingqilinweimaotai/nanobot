@@ -5,10 +5,12 @@ import {
   MAX_WORKBENCH_PANES,
   addWorkbenchPane,
   attachWorkbenchPane,
+  contiguousWorkbenchSessionOrder,
   createWorkbenchTab,
   detachWorkbenchPane,
   dissolveWorkbenchTab,
   normalizeWorkbenchState,
+  moveSessionBesideWorkbenchBlock,
   orderWorkbenchTabs,
   reconcileWorkbench,
   renameWorkbenchTab,
@@ -157,6 +159,51 @@ describe("workbench model", () => {
       { tabKey: workbenchTabForPane(state, "pane-e").tabKey, paneKeys: ["pane-e"] },
     ]);
     expect(Object.keys(state.tabs)).toHaveLength(2);
+  });
+
+  it("preserves manual block order when pane membership changes", () => {
+    let state = addWorkbenchPane(EMPTY_WORKBENCH_STATE, "pane-a", "pane-b");
+    state = addWorkbenchPane(state, "pane-c", "pane-d");
+    const alphaTabKey = workbenchTabForPane(state, "pane-a").tabKey;
+    const betaTabKey = workbenchTabForPane(state, "pane-c").tabKey;
+    const visibleOrder = ["pane-a", "pane-b", "pane-e", "pane-c", "pane-d"];
+
+    expect(contiguousWorkbenchSessionOrder(
+      state,
+      ["pane-a", "pane-e", "pane-c", "pane-b", "pane-d"],
+    )).toEqual(visibleOrder);
+    expect(moveSessionBesideWorkbenchBlock(
+      state,
+      visibleOrder,
+      "pane-b",
+      "pane-a",
+      "after",
+    )).toEqual(visibleOrder);
+    expect(moveSessionBesideWorkbenchBlock(
+      state,
+      visibleOrder,
+      "pane-e",
+      "pane-c",
+      "after",
+    )).toEqual(["pane-a", "pane-b", "pane-c", "pane-d", "pane-e"]);
+
+    const tabs = orderWorkbenchTabs(
+      state,
+      visibleOrder,
+      new Map([
+        ["pane-a", "2026-08-01T10:00:00Z"],
+        ["pane-b", "2026-08-05T10:00:00Z"],
+        ["pane-c", "2026-08-03T10:00:00Z"],
+        ["pane-d", "2026-08-04T10:00:00Z"],
+        ["pane-e", "2026-08-06T10:00:00Z"],
+      ]),
+      true,
+    );
+    expect(tabs.map(({ tabKey }) => tabKey)).toEqual([
+      alphaTabKey,
+      workbenchTabForPane(state, "pane-e").tabKey,
+      betaTabKey,
+    ]);
   });
 
   it("caps a group at four panes", () => {

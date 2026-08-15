@@ -3111,6 +3111,194 @@ describe("App layout", () => {
       .toBeTruthy();
   });
 
+  it("keeps the surrounding sidebar order when a pane leaves a group", async () => {
+    mockSessions = [
+      {
+        key: "websocket:group-root",
+        channel: "websocket",
+        chatId: "group-root",
+        createdAt: "2026-08-01T10:00:00Z",
+        updatedAt: "2026-08-01T10:00:00Z",
+        title: "Group root",
+        preview: "",
+      },
+      {
+        key: "websocket:group-child",
+        channel: "websocket",
+        chatId: "group-child",
+        createdAt: "2026-08-05T10:00:00Z",
+        updatedAt: "2026-08-05T10:00:00Z",
+        title: "Group child",
+        preview: "",
+      },
+      {
+        key: "websocket:middle",
+        channel: "websocket",
+        chatId: "middle",
+        createdAt: "2026-08-04T10:00:00Z",
+        updatedAt: "2026-08-04T10:00:00Z",
+        title: "Middle topic",
+        preview: "",
+      },
+      {
+        key: "websocket:tail",
+        channel: "websocket",
+        chatId: "tail",
+        createdAt: "2026-08-03T10:00:00Z",
+        updatedAt: "2026-08-03T10:00:00Z",
+        title: "Tail topic",
+        preview: "",
+      },
+    ];
+    mockFetchRoutes({
+      "/api/webui/sidebar-state": {
+        workbench: {
+          version: 1,
+          tabs: {
+            "tab:websocket:group-root": {
+              explicit: true,
+              title: "Stable group",
+              paneKeys: ["websocket:group-root", "websocket:group-child"],
+              layout: "columns",
+            },
+          },
+        },
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    act(() => {
+      statusHandlers.forEach((handler) => handler("open"));
+    });
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    expect(await within(sidebar).findByRole("button", { name: "Group: Stable group" }))
+      .toBeInTheDocument();
+    setSidebarStateSpy.mockClear();
+
+    fireEvent.pointerDown(within(sidebar).getByRole("button", {
+      name: "Group child pane actions",
+    }), { button: 0, ctrlKey: false });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove" }));
+
+    await waitFor(() => expect(setSidebarStateSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        session_order: [
+          "websocket:group-root",
+          "websocket:group-child",
+          "websocket:middle",
+          "websocket:tail",
+        ],
+        view: expect.objectContaining({ sort: "manual" }),
+        workbench: expect.objectContaining({
+          tabs: expect.objectContaining({
+            "tab:websocket:group-root": expect.objectContaining({
+              paneKeys: ["websocket:group-root"],
+            }),
+          }),
+        }),
+      }),
+    ));
+  });
+
+  it("keeps the target block in place when a topic joins a group", async () => {
+    mockSessions = [
+      {
+        key: "websocket:target-root",
+        channel: "websocket",
+        chatId: "target-root",
+        createdAt: "2026-08-01T10:00:00Z",
+        updatedAt: "2026-08-01T10:00:00Z",
+        title: "Target root",
+        preview: "",
+      },
+      {
+        key: "websocket:target-child",
+        channel: "websocket",
+        chatId: "target-child",
+        createdAt: "2026-08-04T10:00:00Z",
+        updatedAt: "2026-08-04T10:00:00Z",
+        title: "Target child",
+        preview: "",
+      },
+      {
+        key: "websocket:solo",
+        channel: "websocket",
+        chatId: "solo",
+        createdAt: "2026-08-05T10:00:00Z",
+        updatedAt: "2026-08-05T10:00:00Z",
+        title: "Solo topic",
+        preview: "",
+      },
+      {
+        key: "websocket:tail",
+        channel: "websocket",
+        chatId: "tail",
+        createdAt: "2026-08-03T10:00:00Z",
+        updatedAt: "2026-08-03T10:00:00Z",
+        title: "Tail topic",
+        preview: "",
+      },
+    ];
+    mockFetchRoutes({
+      "/api/webui/sidebar-state": {
+        workbench: {
+          version: 1,
+          tabs: {
+            "tab:websocket:target-root": {
+              explicit: true,
+              title: "Target group",
+              paneKeys: ["websocket:target-root", "websocket:target-child"],
+              layout: "columns",
+            },
+          },
+        },
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    act(() => {
+      statusHandlers.forEach((handler) => handler("open"));
+    });
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    expect(await within(sidebar).findByRole("button", { name: "Group: Target group" }))
+      .toBeInTheDocument();
+    setSidebarStateSpy.mockClear();
+
+    fireEvent.pointerDown(within(sidebar).getByRole("button", {
+      name: "Topic actions for Solo topic",
+    }), { button: 0, ctrlKey: false });
+    const moveTo = await screen.findByRole("menuitem", { name: "Move to" });
+    fireEvent.pointerMove(moveTo, { pointerType: "mouse" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Target group · 2/4" }));
+
+    await waitFor(() => expect(setSidebarStateSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        session_order: [
+          "websocket:target-child",
+          "websocket:target-root",
+          "websocket:solo",
+          "websocket:tail",
+        ],
+        view: expect.objectContaining({ sort: "manual" }),
+        workbench: expect.objectContaining({
+          tabs: expect.objectContaining({
+            "tab:websocket:target-root": expect.objectContaining({
+              paneKeys: [
+                "websocket:target-root",
+                "websocket:target-child",
+                "websocket:solo",
+              ],
+            }),
+          }),
+        }),
+      }),
+    ));
+  });
+
   it("uses one active pane without workbench editing controls on mobile", async () => {
     vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
       matches: query.includes("max-width: 767px"),

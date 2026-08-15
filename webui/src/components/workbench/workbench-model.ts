@@ -30,6 +30,8 @@ export interface OrderedWorkbenchTab extends WorkbenchTabMatch {
   updatedAt: string | null;
 }
 
+type DropEdge = "before" | "after";
+
 export const EMPTY_WORKBENCH_STATE: WorkbenchState = {
   version: 1,
   tabs: {},
@@ -392,6 +394,7 @@ export function orderWorkbenchTabs(
   state: WorkbenchState,
   orderedSessionKeys: readonly string[],
   updatedAtByKey: ReadonlyMap<string, string | null | undefined>,
+  manualOrder = false,
 ): OrderedWorkbenchTab[] {
   const rank = new Map(orderedSessionKeys.map((key, index) => [key, index]));
   const validKeys = new Set(orderedSessionKeys);
@@ -417,12 +420,71 @@ export function orderWorkbenchTabs(
   });
 
   return tabs.sort((left, right) => {
-    const updateOrder = dateToTime(right.updatedAt) - dateToTime(left.updatedAt);
-    if (updateOrder !== 0) return updateOrder;
     const leftRank = Math.min(...left.paneKeys.map((key) => rank.get(key) ?? Infinity));
     const rightRank = Math.min(...right.paneKeys.map((key) => rank.get(key) ?? Infinity));
+    if (manualOrder) return leftRank - rightRank;
+    const updateOrder = dateToTime(right.updatedAt) - dateToTime(left.updatedAt);
+    if (updateOrder !== 0) return updateOrder;
     return leftRank - rightRank;
   });
+}
+
+export function contiguousWorkbenchSessionOrder(
+  state: WorkbenchState,
+  orderedSessionKeys: readonly string[],
+): string[] {
+  const rank = new Map(orderedSessionKeys.map((key, index) => [key, index]));
+  const validKeys = new Set(orderedSessionKeys);
+  const tabKeyByPane = new Map<string, string>();
+  for (const [tabKey, tab] of Object.entries(state.tabs)) {
+    for (const paneKey of tab.paneKeys) tabKeyByPane.set(paneKey, tabKey);
+  }
+
+  const emittedTabs = new Set<string>();
+  const result: string[] = [];
+  for (const sessionKey of orderedSessionKeys) {
+    const tabKey = tabKeyByPane.get(sessionKey);
+    if (!tabKey) {
+      result.push(sessionKey);
+      continue;
+    }
+    if (emittedTabs.has(tabKey)) continue;
+    emittedTabs.add(tabKey);
+    result.push(...state.tabs[tabKey].paneKeys
+      .filter((key) => validKeys.has(key))
+      .sort((left, right) => (rank.get(left) ?? Infinity) - (rank.get(right) ?? Infinity)));
+  }
+  return result;
+}
+
+export function moveSessionBesideWorkbenchBlock(
+  state: WorkbenchState,
+  orderedSessionKeys: readonly string[],
+  sourcePaneKey: string,
+  targetPaneKey: string,
+  edge: DropEdge,
+): string[] {
+  const order = contiguousWorkbenchSessionOrder(state, orderedSessionKeys);
+  if (
+    sourcePaneKey === targetPaneKey
+    || !order.includes(sourcePaneKey)
+    || !order.includes(targetPaneKey)
+  ) return order;
+
+  const sourceBlock = order.filter((key) => key === sourcePaneKey);
+  const withoutSource = order.filter((key) => key !== sourcePaneKey);
+  const targetTab = workbenchTabForPane(state, targetPaneKey);
+  const targetIndexes = targetTab.tab.paneKeys
+    .filter((key) => key !== sourcePaneKey)
+    .map((key) => withoutSource.indexOf(key))
+    .filter((index) => index >= 0);
+  if (targetIndexes.length === 0) return order;
+
+  const insertIndex = edge === "before"
+    ? Math.min(...targetIndexes)
+    : Math.max(...targetIndexes) + 1;
+  withoutSource.splice(insertIndex, 0, ...sourceBlock);
+  return withoutSource;
 }
 
 function dateToTime(value: string | null | undefined): number {

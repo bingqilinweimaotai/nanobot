@@ -20,9 +20,11 @@ import {
   MAX_WORKBENCH_PANES,
   addWorkbenchPane,
   attachWorkbenchPane,
+  contiguousWorkbenchSessionOrder,
   createWorkbenchTab,
   detachWorkbenchPane,
   dissolveWorkbenchTab,
+  moveSessionBesideWorkbenchBlock,
   orderWorkbenchTabs,
   reconcileWorkbench,
   renameWorkbenchTab,
@@ -66,6 +68,7 @@ import type {
   PairingRequestInfo,
   SessionAutomationJob,
   SettingsPayload,
+  SidebarStatePayload,
   WorkspaceScopePayload,
   WorkspacesPayload,
 } from "@/lib/types";
@@ -2250,13 +2253,10 @@ function Shell({
     || deriveTitle(session.preview, t("chat.newChat"))
   ), [sidebarState.title_overrides, t]);
 
-  const automaticSidebarSort = sidebarState.view.sort === "manual"
-    ? "updated_desc"
-    : sidebarState.view.sort;
   const orderedWorkbenchTabs = useMemo(() => {
     const orderedSessions = sortSessions(
       sessions,
-      automaticSidebarSort,
+      sidebarState.view.sort,
       sidebarState.title_overrides,
       sidebarState.session_order,
     );
@@ -2268,12 +2268,13 @@ function Shell({
       workbenchState,
       orderedSessions.map((session) => session.key),
       updatedAtByKey,
+      sidebarState.view.sort === "manual",
     );
   }, [
-    automaticSidebarSort,
     sessions,
     sidebarState.session_order,
     sidebarState.title_overrides,
+    sidebarState.view.sort,
     workbenchState,
   ]);
   const orderedWorkbenchTabsByKey = useMemo(
@@ -2399,6 +2400,14 @@ function Shell({
   const activePaneLimitReached = Boolean(
     activeTabState && activeTabState.paneKeys.length >= MAX_WORKBENCH_PANES,
   );
+  const orderedSidebarSessionKeys = useCallback((state: SidebarStatePayload) => (
+    sortSessions(
+      sessions,
+      state.view.sort,
+      state.title_overrides,
+      state.session_order,
+    ).map((session) => session.key)
+  ), [sessions]);
 
   const onActivateWorkbenchPane = useCallback((paneKey: string) => {
     onSelectChat(paneKey);
@@ -2431,8 +2440,28 @@ function Shell({
   }, [onSelectChat]);
 
   const onDetachWorkbenchPane = useCallback((tabKey: string, paneKey: string) => {
-    updateWorkbenchState((current) => detachWorkbenchPane(current, tabKey, paneKey));
-  }, [updateWorkbenchState]);
+    void updateSidebarState((current) => {
+      const tab = workbenchTab(current.workbench, tabKey);
+      if (!tab?.paneKeys.includes(paneKey)) return current;
+      const orderedKeys = orderedSidebarSessionKeys(current);
+      if (!orderedKeys.includes(paneKey)) return current;
+      const remainingPaneKey = tab.paneKeys.find((key) => key !== paneKey);
+      return {
+        ...current,
+        session_order: remainingPaneKey
+          ? moveSessionBesideWorkbenchBlock(
+              current.workbench,
+              orderedKeys,
+              paneKey,
+              remainingPaneKey,
+              "after",
+            )
+          : contiguousWorkbenchSessionOrder(current.workbench, orderedKeys),
+        workbench: detachWorkbenchPane(current.workbench, tabKey, paneKey),
+        view: { ...current.view, sort: "manual" },
+      };
+    });
+  }, [orderedSidebarSessionKeys, updateSidebarState]);
 
   const onCreateWorkbenchTab = useCallback((paneKey: string) => {
     updateWorkbenchState((current) => createWorkbenchTab(current, paneKey));
@@ -2446,16 +2475,30 @@ function Shell({
     paneKey: string,
     tabKey: string,
   ) => {
-    updateWorkbenchState((current) => {
-      const target = workbenchTab(current, tabKey);
+    void updateSidebarState((current) => {
+      const target = workbenchTab(current.workbench, tabKey);
       if (
         !target
         || (!target.explicit && target.paneKeys.length < 2)
         || (!target.paneKeys.includes(paneKey) && target.paneKeys.length >= MAX_WORKBENCH_PANES)
       ) return current;
-      return attachWorkbenchPane(current, tabKey, paneKey);
+      const orderedKeys = orderedSidebarSessionKeys(current);
+      const nextWorkbench = attachWorkbenchPane(current.workbench, tabKey, paneKey);
+      if (!orderedKeys.includes(paneKey) || nextWorkbench === current.workbench) return current;
+      return {
+        ...current,
+        session_order: moveSessionBesideWorkbenchBlock(
+          current.workbench,
+          orderedKeys,
+          paneKey,
+          target.paneKeys.at(-1) ?? target.paneKeys[0],
+          "after",
+        ),
+        workbench: nextWorkbench,
+        view: { ...current.view, sort: "manual" },
+      };
     });
-  }, [updateWorkbenchState]);
+  }, [orderedSidebarSessionKeys, updateSidebarState]);
 
   useEffect(() => {
     if (view === "settings") {
@@ -2551,7 +2594,7 @@ function Shell({
     collapsedGroups: sidebarState.collapsed_groups,
     runningChatIds: runningChatIdList,
     updatedChatIds: updatedChatIdList,
-    viewState: { ...sidebarState.view, sort: automaticSidebarSort },
+    viewState: sidebarState.view,
     showArchived: sidebarState.view.show_archived,
     archivedCount: sidebarArchivedTabKeys.length,
     defaultWorkspacePath: workspaces?.default_scope.project_path ?? null,
